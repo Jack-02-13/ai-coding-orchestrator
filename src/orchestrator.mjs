@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { access, realpath, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { CodexAppServer } from './codex-app-server.mjs';
-import { parseDecision } from './helpers.mjs';
+import { parseDecision, redactSensitiveText } from './helpers.mjs';
 import { ensureFreshPlanToken, listAvailableModels, PlanRequestError, streamResponse } from './openai-plan.mjs';
+import { revokeOAuthSession } from './oauth.mjs';
 import { LocalVault } from './vault.mjs';
 
 const GPT_INSTRUCTIONS = `你是本機 GPT ↔ Codex 開發流程的 GPT 管理者。請保留使用者完整需求，將工作整理成 Codex 可執行的步驟，再根據 Codex 實際回報審查結果。除非 Codex 提供證據，否則不得宣稱測試通過。不得建議 API Key、付費 API fallback、發布、洩漏秘密或修改所選專案以外的檔案。
@@ -133,14 +134,26 @@ export class Orchestrator {
     const current = this.credentials;
     data.auth = current ? {
       connected: true,
-      email: current.email || '',
-      scopes: current.scopes ?? [],
-      expiresAt: current.expires_at,
       planUsageEnabled: (current.scopes ?? []).includes('chatgpt.tokens.use.direct'),
-    } : { connected: false, email: '', scopes: [], planUsageEnabled: false };
-    data.storageLocation = this.vault.directory;
+    } : { connected: false, planUsageEnabled: false };
+    delete data.clientId;
+    delete data.hostId;
+    delete data.codexThreads;
+    delete data.gptHistory;
+    for (const task of data.tasks) {
+      delete task.gptHistory;
+      delete task.codexThreadId;
+    }
+    data.storageLocation = 'Windows DPAPI 本機加密儲存';
     data.codexAvailable = true;
-    return data;
+    const secrets = [current?.access_token, current?.refresh_token, current?.id_token];
+    const redactSnapshot = (value) => {
+      if (typeof value === 'string') return redactSensitiveText(value, secrets, { redactPersonalData: false });
+      if (Array.isArray(value)) return value.map(redactSnapshot);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSnapshot(item)]));
+      return value;
+    };
+    return redactSnapshot(data);
   }
 
   broadcast(type = 'state') {
@@ -172,7 +185,13 @@ export class Orchestrator {
   async setError(error) {
     // Keep the persisted quota reason until a human explicitly clears the pause.
     if (!(this.state.planBlocked && this.state.lastError?.kind === 'quota' && error.kind !== 'quota')) {
-      this.state.lastError = { kind: error.kind ?? 'error', message: error.message ?? String(error), detail: error.detail ?? '', code: error.code ?? null };
+      const secrets = [this.credentials?.access_token, this.credentials?.refresh_token, this.credentials?.id_token];
+      this.state.lastError = {
+        kind: error.kind ?? 'error',
+        message: redactSensitiveText(error.message ?? String(error), secrets),
+        detail: redactSensitiveText(error.detail ?? '', secrets),
+        code: redactSensitiveText(error.code ?? '', secrets) || null,
+      };
     }
     this.state.status = 'paused';
     this.state.planBlocked = this.state.planBlocked || ['quota', 'unavailable'].includes(error.kind);
@@ -200,6 +219,25 @@ export class Orchestrator {
     await this.vault.write('credentials.dpapi.json', updated);
     if (this.codex) { this.codex.close(); this.codex = null; }
     this.broadcast();
+  }
+
+  async signOut() {
+    await this.control('stop');
+    const previous = this.credentials;
+    const remoteRevocationConfirmed = await revokeOAuthSession(previous).catch(() => false);
+    await this.vault.remove('credentials.dpapi.json');
+    this.credentials = null;
+    this.state.clientId = previous?.client_id ?? this.state.clientId;
+    this.state.hostId = previous?.ext_agent_host_id ?? this.state.hostId;
+    this.state.models = [];
+    this.state.gptModel = '';
+    this.state.codexModel = '';
+    this.state.authMessage = remoteRevocationConfirmed
+      ? 'ChatGPT session revoked and local credentials cleared.'
+      : 'Local credentials cleared, but OpenAI could not confirm remote revocation. Disconnect this app in ChatGPT settings.';
+    await this.persistNow();
+    this.broadcast();
+    return { ok: true, remoteRevocationConfirmed };
   }
 
   async refreshModels() {
@@ -631,7 +669,7 @@ export class Orchestrator {
   async runCodex(task) {
     const credentials = await ensureFreshPlanToken(await this.credentialsForUse(), (updated) => this.saveRefreshedCredentials(updated));
     if (!this.codex) {
-      this.codex = new CodexAppServer({ accessToken: credentials.access_token, onProgress: (event) => {
+      this.codex = new CodexAppServer({ accessToken: credentials.access_token, codexHome: this.vault.codexDirectory, onProgress: (event) => {
         if (event.kind === 'command') this.addEvent('activity', codexActivityText(event), { taskId: task.id });
       } });
     }

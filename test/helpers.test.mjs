@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
-import { extractSseEvents, makeResponsesPayload, classifyPlanFailure, parseDecision } from '../src/helpers.mjs';
-import { makeAuthorizationAttempt } from '../src/oauth.mjs';
+import { extractSseEvents, makeResponsesPayload, classifyPlanFailure, parseDecision, redactSensitiveText } from '../src/helpers.mjs';
+import { makeAuthorizationAttempt, revokeOAuthSession } from '../src/oauth.mjs';
 import { ensureFreshPlanToken, PlanRequestError, streamResponse } from '../src/openai-plan.mjs';
 import { LocalVault } from '../src/vault.mjs';
 import { Orchestrator } from '../src/orchestrator.mjs';
@@ -33,9 +34,10 @@ test('a new task queues behind a result awaiting human acceptance without starti
   t.mock.method(app, 'setProjectPath', async (value) => value);
   const loop = t.mock.method(app, 'ensureLoop', () => {});
 
+  const testProjectPath = path.join(path.parse(fileURLToPath(new URL('..', import.meta.url))).root, 'ai-developer-test-project');
   const task = await app.startTask({
     text: 'Write a Python script that prints banana.',
-    projectPath: path.join(path.parse(process.cwd()).root, 'ai-developer-test-project'),
+    projectPath: testProjectPath,
     gptModel: 'account-model',
     codexModel: 'account-model',
   });
@@ -77,6 +79,89 @@ test('returning authorization reuses issued client ID, host ID, and retained ID 
   assert.equal(url.searchParams.has('agent_name_hint'), false);
 });
 
+test('OAuth sign-out discovers the trusted issuer revocation endpoint and submits the refresh token', async () => {
+  const requests = [];
+  const fakeFetch = async (url, options) => {
+    requests.push({ url: String(url), options });
+    if (String(url) === 'https://auth.openai.com/.well-known/openid-configuration') {
+      return new Response(JSON.stringify({ issuer: 'https://auth.openai.com', revocation_endpoint: 'https://auth.openai.com/api/accounts/oauth/revoke' }), { status: 200 });
+    }
+    return new Response('', { status: 200 });
+  };
+  const confirmed = await revokeOAuthSession({ refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test' }, { fetchImpl: fakeFetch });
+  assert.equal(confirmed, true);
+  assert.equal(requests.length, 2);
+  const body = new URLSearchParams(requests[1].options.body);
+  assert.equal(body.get('token'), 'synthetic-refresh-token');
+  assert.equal(body.get('token_type_hint'), 'refresh_token');
+  assert.equal(body.get('client_id'), 'oaiapp_test');
+  assert.equal(requests[1].options.redirect, 'error');
+});
+
+test('OAuth sign-out refuses a revocation endpoint outside the trusted issuer', async () => {
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ issuer: 'https://auth.openai.com', revocation_endpoint: 'https://attacker.invalid/revoke' }), { status: 200 });
+  };
+  const confirmed = await revokeOAuthSession({ refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test' }, { fetchImpl: fakeFetch });
+  assert.equal(confirmed, false);
+  assert.equal(calls, 1);
+});
+
+test('OAuth revocation retries one temporary server failure, then stops', async () => {
+  let revokeCalls = 0;
+  const fakeFetch = async (url) => {
+    if (String(url) === 'https://auth.openai.com/.well-known/openid-configuration') {
+      return new Response(JSON.stringify({ issuer: 'https://auth.openai.com', revocation_endpoint: 'https://auth.openai.com/revoke' }), { status: 200 });
+    }
+    revokeCalls += 1;
+    return new Response('', { status: 503 });
+  };
+  const confirmed = await revokeOAuthSession({ refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test' }, { fetchImpl: fakeFetch, delay: async () => {} });
+  assert.equal(confirmed, false);
+  assert.equal(revokeCalls, 2);
+});
+
+test('sign-out stops work, attempts revocation, clears local credentials, and keeps registration identity', async (t) => {
+  const app = new Orchestrator();
+  t.mock.method(app.vault, 'write', async () => {});
+  t.mock.method(app.vault, 'remove', async (name) => assert.equal(name, 'credentials.dpapi.json'));
+  app.credentials = {
+    access_token: 'synthetic-access-token', refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test',
+    ext_agent_host_id: 'urn:uuid:synthetic-host', scopes: ['chatgpt.tokens.use.direct'],
+  };
+  app.state.clientId = 'oaiapp_test';
+  app.state.hostId = 'urn:uuid:synthetic-host';
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => String(url) === 'https://auth.openai.com/.well-known/openid-configuration'
+    ? new Response(JSON.stringify({ issuer: 'https://auth.openai.com', revocation_endpoint: 'https://auth.openai.com/revoke' }), { status: 200 })
+    : new Response('', { status: 200 });
+  try {
+    const result = await app.signOut();
+    assert.equal(result.remoteRevocationConfirmed, true);
+    assert.equal(app.credentials, null);
+    assert.equal(app.state.clientId, 'oaiapp_test');
+    assert.equal(app.state.hostId, 'urn:uuid:synthetic-host');
+    assert.equal(app.state.authMessage.includes('revoked'), true);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('sign-out clears local credentials even when remote revocation cannot be confirmed', async (t) => {
+  const app = new Orchestrator();
+  t.mock.method(app.vault, 'write', async () => {});
+  t.mock.method(app.vault, 'remove', async () => {});
+  app.credentials = { access_token: 'synthetic-access-token', refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test' };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('synthetic offline failure'); };
+  try {
+    const result = await app.signOut();
+    assert.equal(result.remoteRevocationConfirmed, false);
+    assert.equal(app.credentials, null);
+    assert.match(app.state.authMessage, /Disconnect this app in ChatGPT settings/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('a host identifier prepared by the app is reused across fresh OAuth attempts', () => {
   const hostId = 'urn:uuid:fe42d302-49d4-4d01-a34c-7b74299d5cb1';
   const first = makeAuthorizationAttempt({ port: 1455, credentials: null, hostId });
@@ -92,6 +177,17 @@ test('Responses plan requests always have store=false and stream=true', () => {
   assert.equal(body.store, false);
   assert.equal(body.stream, true);
   assert.equal(body.input[0].content, 'hello');
+});
+
+test('sensitive text redaction masks bearer tokens, emails, and local profile paths', () => {
+  const fakeToken = 'unit-test-secret-token-987654321';
+  const output = redactSensitiveText(`Bearer ${fakeToken} test@example.invalid D:\\SyntheticUser\\Project` , [fakeToken]);
+  assert.equal(output.includes(fakeToken), false);
+  assert.equal(output.includes('test@example.invalid'), false);
+  assert.equal(output.includes('D:\\SyntheticUser'), false);
+  assert.match(output, /憑證已遮蔽/);
+  assert.match(output, /個資已遮蔽/);
+  assert.match(output, /本機路徑已遮蔽/);
 });
 
 test('Responses API stream uses the public endpoint, bearer OAuth, and succeeds only at response.completed', async () => {
@@ -166,6 +262,29 @@ test('Codex receives a refreshed ChatGPT plan token before app-server inference'
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('concurrent requests serialize refresh and persist the rotated token once', async () => {
+  const originalFetch = globalThis.fetch;
+  let refreshCalls = 0;
+  let persistCalls = 0;
+  globalThis.fetch = async () => {
+    refreshCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return new Response(JSON.stringify({
+      access_token: 'synthetic-access-token', refresh_token: 'synthetic-refresh-token-rotated', expires_in: 3600,
+      scope: 'openid offline_access resource.invoke chatgpt.tokens.use.direct',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const credentials = { access_token: 'synthetic-expired-access', refresh_token: 'synthetic-refresh-token', client_id: 'oaiapp_test', expires_at: Date.now() - 1000, scopes: ['chatgpt.tokens.use.direct'] };
+    const persist = async () => { persistCalls += 1; };
+    const [first, second] = await Promise.all([ensureFreshPlanToken(credentials, persist), ensureFreshPlanToken(credentials, persist)]);
+    assert.equal(refreshCalls, 1);
+    assert.equal(persistCalls, 1);
+    assert.equal(first, second);
+    assert.equal(first.refresh_token, 'synthetic-refresh-token-rotated');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('SSE parser emits complete JSON events and retains an incomplete trailing block', () => {
   const parsed = extractSseEvents('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n' + 'data: {"type":"response.completed"}');
   assert.equal(parsed.events.length, 1);
@@ -190,6 +309,39 @@ test('a quota pause blocks model refresh, GPT test, and task starts until manual
   assert.equal(app.state.messages.length, 0);
 });
 
+test('dashboard snapshots omit OAuth credentials, account identifiers, and Codex private history', () => {
+  const app = new Orchestrator();
+  app.credentials = {
+    access_token: 'synthetic-access-token-secret', refresh_token: 'synthetic-refresh-token-secret', id_token: 'synthetic-id-token-secret',
+    client_id: 'oaiapp_private_test', subject: 'synthetic-subject', email: 'person@example.invalid',
+    expires_at: 123, scopes: ['openid', 'chatgpt.tokens.use.direct'], ext_agent_host_id: 'urn:uuid:private-host-id',
+  };
+  app.state.clientId = 'oaiapp_private_test';
+  app.state.hostId = 'urn:uuid:private-host-id';
+  app.state.gptHistory = [{ role: 'user', content: 'private GPT history' }];
+  app.state.codexThreads = { private: 'private-thread-id' };
+  app.state.messages = [{ role: 'activity', content: 'Bearer synthetic-access-token-secret' }];
+  app.state.tasks = [{ id: 'task', status: 'queued', gptHistory: [{ content: 'private task history' }], codexThreadId: 'private-thread-id' }];
+  const output = JSON.stringify(app.snapshot());
+  for (const item of ['synthetic-access-token-secret', 'synthetic-refresh-token-secret', 'synthetic-id-token-secret', 'person@example.invalid', 'private-host-id', 'private-thread-id', 'private GPT history', 'private task history', 'oaiapp_private_test']) {
+    assert.equal(output.includes(item), false);
+  }
+  assert.match(output, /"planUsageEnabled":true/);
+  assert.match(output, /Windows DPAPI/);
+  assert.match(output, /Bearer \[憑證已遮蔽\]/);
+});
+
+test('persisted errors redact bearer tokens and personal identifiers', async (t) => {
+  const app = new Orchestrator();
+  t.mock.method(app.vault, 'write', async () => {});
+  app.credentials = { access_token: 'synthetic-access-token-secret', refresh_token: 'synthetic-refresh-token-secret' };
+  await app.setError(Object.assign(new Error('Bearer synthetic-access-token-secret person@example.invalid'), { detail: 'refresh_token=synthetic-refresh-token-secret' }));
+  const output = JSON.stringify(app.state.lastError);
+  assert.equal(output.includes('synthetic-access-token-secret'), false);
+  assert.equal(output.includes('synthetic-refresh-token-secret'), false);
+  assert.equal(output.includes('person@example.invalid'), false);
+});
+
 test('GPT decisions require a well-formed explicit result marker', () => {
   assert.deepEqual(parseDecision('No marker; treat as human input.'), { action: 'human', summary: 'No marker; treat as human input.', nextPrompt: '' });
   const result = parseDecision('Plan.\n<result>{"action":"continue","summary":"Need tests","next_prompt":"Add tests","acceptance_criteria":["green"]}</result>');
@@ -201,7 +353,7 @@ test('GPT decisions require a well-formed explicit result marker', () => {
   assert.equal(chinese.summary, '功能已完成，測試通過。');
 });
 
-test('local progress and credentials can be round-tripped through the current-user vault', async () => {
+test('local progress and credentials can be round-tripped through the current-user vault', { skip: process.platform !== 'win32' }, async () => {
   const scratch = await mkdtemp(path.join(fileURLToPath(new URL('.', import.meta.url)), 'vault-test-'));
   const vault = new LocalVault();
   vault.directory = scratch;
@@ -215,4 +367,36 @@ test('local progress and credentials can be round-tripped through the current-us
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+});
+
+test('vault file names reject traversal and absolute paths', () => {
+  const vault = new LocalVault();
+  assert.throws(() => vault.file('../outside.json'), /Invalid local vault file name/);
+  assert.throws(() => vault.file('C:\\outside.json'), /Invalid local vault file name/);
+});
+
+test('gitignore excludes local secrets and databases without excluding JSON fixtures', () => {
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const ignored = (file) => {
+    try { execFileSync('git', ['check-ignore', '--no-index', '-q', file], { cwd: repoRoot, stdio: 'ignore' }); return true; }
+    catch { return false; }
+  };
+  for (const file of ['.env.local', 'credentials.dpapi.json', 'test/quota-test-fixture/state.dpapi.json', 'app.sqlite', 'private.log', 'codex-home/state.sqlite', 'session.cookie', 'private.pem', 'outputs/private-report.txt']) {
+    assert.equal(ignored(file), true, `${file} should be ignored`);
+  }
+  assert.equal(ignored('.env.example'), false);
+  assert.equal(ignored('test/fixtures/sample.json'), false);
+});
+
+test('Codex shell environment is allowlisted and does not inherit application secrets', async () => {
+  const { buildCodexEnvironment } = await import('../src/codex-app-server.mjs');
+  const env = buildCodexEnvironment('unit-test-oauth-token', 'C:\\private\\app-codex-home', {
+    PATH: 'C:\\Windows\\System32', SystemRoot: 'C:\\Windows', OPENAI_API_KEY: 'unit-test-api-key',
+    SECRET_VALUE: 'unit-test-secret', ACCESS_TOKEN: 'parent-token', USERPROFILE: 'C:\\SyntheticProfile',
+  });
+  assert.deepEqual(env, {
+    PATH: 'C:\\Windows\\System32', SYSTEMROOT: 'C:\\Windows', USERPROFILE: 'C:\\SyntheticProfile', CODEX_HOME: 'C:\\private\\app-codex-home', ACCESS_TOKEN: 'unit-test-oauth-token',
+  });
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.SECRET_VALUE, undefined);
 });

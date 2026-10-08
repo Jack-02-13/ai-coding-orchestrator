@@ -38,18 +38,17 @@ export function makeAuthorizationAttempt({ port, credentials, hostId: savedHostI
 
 export async function exchangeCode({ code, clientId, verifier, redirectUri }) {
   const form = new URLSearchParams({ grant_type: 'authorization_code', code, client_id: clientId, code_verifier: verifier, redirect_uri: redirectUri, resource: RESOURCE });
-  const response = await fetch(`${AUTH_BASE}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error_description ?? payload?.error ?? `OAuth token exchange failed (HTTP ${response.status}).`);
-  return payload;
+  const response = await fetch(`${AUTH_BASE}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form, redirect: 'error' });
+  if (!response.ok) throw new Error(`OAuth token exchange failed (HTTP ${response.status}).`);
+  return response.json();
 }
 
 export async function refreshAccessToken(credentials) {
   if (!credentials.refresh_token) throw new Error('No refresh token is available. Sign in with ChatGPT again.');
   const form = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: credentials.refresh_token, client_id: credentials.client_id, resource: RESOURCE });
-  const response = await fetch(`${AUTH_BASE}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error_description ?? payload?.error ?? `OAuth refresh failed (HTTP ${response.status}).`);
+  const response = await fetch(`${AUTH_BASE}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form, redirect: 'error' });
+  if (!response.ok) throw new Error(`OAuth refresh failed (HTTP ${response.status}).`);
+  const payload = await response.json();
   const scopes = String(payload.scope ?? credentials.scopes.join(' ')).split(/\s+/).filter(Boolean);
   if (!scopes.includes(REQUIRED_PLAN_SCOPE)) throw new Error('The refreshed grant no longer includes chatgpt.tokens.use.direct. Sign in again and approve ChatGPT plan usage.');
   return {
@@ -60,6 +59,34 @@ export async function refreshAccessToken(credentials) {
     expires_at: Date.now() + Number(payload.expires_in ?? 3600) * 1000,
     scopes,
   };
+}
+
+export async function revokeOAuthSession(credentials, { fetchImpl = fetch, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+  if (!credentials?.refresh_token || !credentials?.client_id) return false;
+  let endpoint;
+  try {
+    const metadataResponse = await fetchImpl('https://auth.openai.com/.well-known/openid-configuration', {
+      headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(5000),
+    });
+    if (!metadataResponse.ok) return false;
+    const metadata = await metadataResponse.json();
+    endpoint = new URL(metadata.revocation_endpoint);
+    if (metadata.issuer !== ISSUER || endpoint.origin !== ISSUER) return false;
+  } catch { return false; }
+
+  const form = new URLSearchParams({ token: credentials.refresh_token, token_type_hint: 'refresh_token', client_id: credentials.client_id });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetchImpl(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: form, redirect: 'error', signal: AbortSignal.timeout(5000),
+      });
+      if (response.status === 200) return true;
+      if (response.status < 500 || attempt === 1) return false;
+    } catch { if (attempt === 1) return false; }
+    await delay(250);
+  }
+  return false;
 }
 
 export async function validateTokenResponse(token, { clientId, nonce, previousSubject = null, hostId }) {

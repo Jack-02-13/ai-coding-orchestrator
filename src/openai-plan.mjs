@@ -1,16 +1,24 @@
-import { API_BASE, classifyPlanFailure, extractSseEvents, formatErrorDetail, makeResponsesPayload } from './helpers.mjs';
+import { API_BASE, classifyPlanFailure, extractSseEvents, formatErrorDetail, makeResponsesPayload, redactSensitiveText } from './helpers.mjs';
 import { refreshAccessToken } from './oauth.mjs';
 
 export class PlanRequestError extends Error {
   constructor(message, details = {}) { super(message); this.name = 'PlanRequestError'; Object.assign(this, details); }
 }
 
+const refreshInFlight = new WeakMap();
+
 async function tokenForRequest(credentials, onRefresh) {
   if (credentials.expires_at > Date.now() + 90_000) return credentials;
   try {
-    const updated = await refreshAccessToken(credentials);
-    await onRefresh(updated);
-    return updated;
+    let refresh = refreshInFlight.get(credentials);
+    if (!refresh) {
+      refresh = refreshAccessToken(credentials).then(async (updated) => {
+        await onRefresh(updated);
+        return updated;
+      }).finally(() => refreshInFlight.delete(credentials));
+      refreshInFlight.set(credentials, refresh);
+    }
+    return await refresh;
   } catch (error) {
     throw new PlanRequestError(error.message, { kind: 'auth', pause: true });
   }
@@ -20,19 +28,21 @@ export async function ensureFreshPlanToken(credentials, onRefresh = async () => 
   return tokenForRequest(credentials, onRefresh);
 }
 
-async function readFailure(response) {
+async function readFailure(response, knownSecrets = []) {
   const text = await response.text().catch(() => '');
   let payload;
   try { payload = JSON.parse(text); } catch { payload = { detail: text }; }
   const recovery = classifyPlanFailure(response.status, payload);
-  const detail = formatErrorDetail(response.status, payload, response.headers.get('x-request-id') ?? '');
-  return new PlanRequestError(recovery.message, { ...recovery, status: response.status, code: payload?.error?.code ?? null, detail, payload });
+  const detail = redactSensitiveText(formatErrorDetail(response.status, payload, response.headers.get('x-request-id') ?? ''), knownSecrets);
+  return new PlanRequestError(redactSensitiveText(recovery.message, knownSecrets), {
+    ...recovery, status: response.status, code: redactSensitiveText(payload?.error?.code ?? '', knownSecrets) || null, detail,
+  });
 }
 
 export async function listAvailableModels(credentials, onRefresh = async () => {}) {
   const current = await tokenForRequest(credentials, onRefresh);
-  const response = await fetch(`${API_BASE}/models`, { headers: { authorization: `Bearer ${current.access_token}` } });
-  if (!response.ok) throw await readFailure(response);
+  const response = await fetch(`${API_BASE}/models`, { headers: { authorization: `Bearer ${current.access_token}` }, redirect: 'error' });
+  if (!response.ok) throw await readFailure(response, [current.access_token]);
   const body = await response.json();
   if (!Array.isArray(body.models)) throw new Error('The signed-in account model response did not contain a models list.');
   return body.models.filter((model) => model.visibility === 'list' && model.slug).map((model) => ({ slug: model.slug, name: model.display_name ?? model.slug }));
@@ -46,8 +56,9 @@ export async function streamResponse({ credentials, model, messages, instruction
     headers: { authorization: `Bearer ${current.access_token}`, 'content-type': 'application/json', accept: 'text/event-stream' },
     body: JSON.stringify(payload),
     signal,
+    redirect: 'error',
   });
-  if (!response.ok) throw await readFailure(response);
+  if (!response.ok) throw await readFailure(response, [current.access_token]);
   if (!response.body) throw new PlanRequestError('The Responses API returned no event stream.', { kind: 'stream', pause: true });
   let buffer = '';
   let output = '';
@@ -71,13 +82,16 @@ export async function streamResponse({ credentials, model, messages, instruction
         } else if (event.type === 'response.failed') {
           const err = event.response?.error ?? {};
           const recovery = classifyPlanFailure(response.status, { error: err });
-          failed = new PlanRequestError(recovery.message, { ...recovery, code: err.code ?? null, detail: formatErrorDetail(response.status, { error: err }, response.headers.get('x-request-id') ?? '') });
+          failed = new PlanRequestError(redactSensitiveText(recovery.message, [current.access_token]), {
+            ...recovery, code: redactSensitiveText(err.code ?? '', [current.access_token]) || null,
+            detail: redactSensitiveText(formatErrorDetail(response.status, { error: err }, response.headers.get('x-request-id') ?? ''), [current.access_token]),
+          });
         } else if (event.type === 'response.incomplete') {
           const reason = event.response?.incomplete_details?.reason ?? 'unspecified';
-          failed = new PlanRequestError(`Responses stream was incomplete (${reason}); it is not treated as a successful answer.`, { kind: 'incomplete', pause: true, detail: reason });
+          failed = new PlanRequestError(redactSensitiveText(`Responses stream was incomplete (${reason}); it is not treated as a successful answer.`, [current.access_token]), { kind: 'incomplete', pause: true, detail: redactSensitiveText(reason, [current.access_token]) });
         } else if (event.type === 'error') {
           const recovery = classifyPlanFailure(response.status, { error: event.error ?? event });
-          failed = new PlanRequestError(recovery.message, { ...recovery, code: event.error?.code ?? null });
+          failed = new PlanRequestError(redactSensitiveText(recovery.message, [current.access_token]), { ...recovery, code: redactSensitiveText(event.error?.code ?? '', [current.access_token]) || null });
         }
       }
       if (failed) throw failed;

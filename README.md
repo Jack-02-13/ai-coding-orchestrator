@@ -67,6 +67,7 @@ Codex can write to the selected project workspace and run commands or checks. Ne
 - **暫停** (Pause): Interrupts the current AI turn and keeps partial progress. You can edit project files by hand, add a requirement, and then click **繼續** (Continue).
 - **繼續** (Continue): Resumes paused work or starts queued work. If a task is waiting for human review, accept it or submit feedback first.
 - **停止** (Stop): Stops the current workflow and prevents new AI requests from starting.
+- **登出** (Sign out): Attempts to revoke the renewable OAuth session through the official OpenID metadata endpoint, then clears local credentials. If revocation cannot be confirmed, the dashboard tells you to disconnect the app in ChatGPT settings.
 - **Reorder queued tasks**: Use the controls next to a queued task to change its priority.
 - **View or save an old transcript**: Select a task in the transcript menu. Click **下載此紀錄** (Download this transcript) to save that task's conversation log.
 
@@ -82,7 +83,8 @@ When GPT or Codex needs a human decision or cannot proceed, the workflow pauses 
 
 ## Conversation data and security
 
-- OAuth credentials, task state, transcripts, the task queue, and Codex thread IDs are stored in `%LOCALAPPDATA%\AI-Developer-Bridge`, outside the source folder. On Windows, credentials and saved state are encrypted with DPAPI for the current Windows account.
+- OAuth credentials, task state, transcripts, the task queue, and Codex thread IDs are stored in `%LOCALAPPDATA%\AI-Developer-Bridge`, outside the source folder. On Windows, the app's credentials and saved state are encrypted with DPAPI for the current Windows account.
+- Codex runs with a dedicated app-local `CODEX_HOME`, filtered command environment, disabled feedback and analytics, and ephemeral threads. This keeps it separate from your regular Codex profile and avoids durable duplicate Codex transcripts. Codex runtime diagnostics remain local in the app data folder and are not part of the encrypted app transcript.
 - GPT needs task history to plan and review, so each request sends the relevant conversation history to OpenAI. Do not include passwords, API keys, private keys, or other secrets you should not send to a model.
 - Responses API requests use `store: false` and `stream: true`; the app maintains its own conversation history. See [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
 - The local dashboard listens only on `127.0.0.1`. Do not expose it to the public internet or upload OAuth tokens or private transcripts to GitHub.

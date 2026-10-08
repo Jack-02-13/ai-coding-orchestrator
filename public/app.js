@@ -253,13 +253,13 @@ function render(next) {
   if (!next) return;
   state = next;
   const connected = Boolean(state.auth?.connected && state.auth?.planUsageEnabled);
-  $('connection-badge').textContent = connected ? (state.auth.email || 'ChatGPT 已授權') : '尚未連線';
+  $('connection-badge').textContent = connected ? 'ChatGPT 已授權' : '尚未連線';
   $('connection-badge').className = `badge ${connected ? 'connected' : 'muted'}`;
   $('auth-button').classList.toggle('hidden', connected);
   $('signout-button').classList.toggle('hidden', !connected);
   $('auth-button').disabled = !state;
   $('auth-detail').textContent = connected
-    ? `${state.auth.email || 'ChatGPT 帳號'} · 訂閱用量授權已驗證`
+    ? 'ChatGPT 訂閱用量授權已驗證'
     : state.authMessage || '使用 Sign in with ChatGPT。此工作台不接受 API Key。';
   const active = state.tasks?.find((task) => task.id === state.activeTaskId);
   const awaitingReview = active?.status === 'review';
@@ -319,8 +319,11 @@ $('auth-button').addEventListener('click', async () => {
   } catch (error) { popup?.close(); toast(error.message); }
 });
 $('signout-button').addEventListener('click', async () => {
-  if (!window.confirm('從 AI Developer Bridge 清除這個 ChatGPT OAuth 授權？')) return;
-  try { await api('/api/auth/signout', {}); toast('ChatGPT 已登出。'); } catch (error) { toast(error.message); }
+  if (!window.confirm('確定登出？工作台會嘗試撤銷 ChatGPT 連線，再清除本機憑證。')) return;
+  try {
+    const result = await api('/api/auth/signout', {});
+    toast(result.remoteRevocationConfirmed ? '已登出並撤銷 ChatGPT 授權。' : '已清除本機授權；請到 ChatGPT 設定確認並中斷此應用程式。');
+  } catch (error) { toast(error.message); }
 });
 $('models-button').addEventListener('click', async () => {
   $('models-button').disabled = true;

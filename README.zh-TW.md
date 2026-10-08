@@ -67,6 +67,7 @@ Codex 會在你指定的專案工作區寫入，並可執行程式及相關檢�
 - **暫停**：停止目前的 AI 回合並保留已收到的部分進度。你可手動修改專案檔案，再補充需求並按 **繼續**。
 - **繼續**：繼續暫停中的工作或開始待辦。若任務正在等待人工驗收，請先驗收或提交修改意見。
 - **停止**：停止目前流程，不會再開始新的 AI 請求。
+- **登出**：工作台會透過官方 OpenID metadata 取得撤銷端點並嘗試撤銷更新用的 OAuth 工作階段，之後清除本機憑證。若無法確認撤銷，畫面會提醒你到 ChatGPT 設定中中斷此應用程式。
 - **調整待辦順序**：使用待辦項目旁的順序控制調整優先級。
 - **查看舊紀錄**：在對話紀錄的選單選擇任務；按 **下載此紀錄**可另存該任務的紀錄檔。
 
@@ -82,7 +83,8 @@ Codex 會在你指定的專案工作區寫入，並可執行程式及相關檢�
 
 ## 對話資料與安全
 
-- OAuth 憑證、任務狀態、對話紀錄、排程及 Codex thread ID 存放在 `%LOCALAPPDATA%\AI-Developer-Bridge`，不存放於專案來源目錄。Windows 上的憑證與狀態使用目前 Windows 帳號的 DPAPI 加密。
+- OAuth 憑證、任務狀態、對話紀錄、排程及 Codex thread ID 存放在 `%LOCALAPPDATA%\AI-Developer-Bridge`，不存放於專案來源目錄。Windows 上，工作台的憑證與狀態使用目前 Windows 帳號的 DPAPI 加密。
+- Codex 使用工作台專屬的 `CODEX_HOME`、經篩選的命令環境、停用的回饋與分析，以及暫存 thread。這會讓它與你平常使用的 Codex 設定分開，也避免額外保存一份長期 Codex 對話。Codex 執行診斷資料仍存於本機工作台資料夾，不屬於 DPAPI 加密的工作台對話紀錄。
 - 因為 GPT 需要規劃與審查，每次請求會把該任務所需的對話歷史送至 OpenAI。請勿提交密碼、API Key、私鑰或不應傳送給模型的機密資料。
 - Responses API 請求設定 `store: false` 與 `stream: true`，並由應用程式自行保留對話歷史。[模型與推論官方文件](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 - 本機控制台只綁定 `127.0.0.1`。不要把它改成可從公用網路存取的服務，也不要將授權 token 或個人對話紀錄上傳到 GitHub。

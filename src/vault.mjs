@@ -13,12 +13,11 @@ async function dpapi(input, decrypt = false) {
   return await new Promise((resolve, reject) => {
     const child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
-    let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+    child.stderr.resume();
     child.on('error', reject);
     child.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`Windows DPAPI protection failed: ${stderr.trim() || `exit ${code}`}`));
+      if (code !== 0) return reject(new Error(`Windows DPAPI protection failed (exit ${code}).`));
       const encoded = stdout.trim();
       resolve(decrypt ? Buffer.from(encoded, 'base64').toString('utf8') : encoded);
     });
@@ -31,10 +30,23 @@ export class LocalVault {
     this.directory = process.env.LOCALAPPDATA
       ? path.join(process.env.LOCALAPPDATA, 'AI-Developer-Bridge')
       : path.join(os.homedir(), '.ai-developer-bridge');
+    this.codexDirectory = path.join(this.directory, 'codex-home');
   }
 
-  file(name) { return path.join(this.directory, name); }
-  async init() { await mkdir(this.directory, { recursive: true, mode: 0o700 }); }
+  file(name) {
+    if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(name) || name === '.' || name === '..') {
+      throw new Error('Invalid local vault file name.');
+    }
+    const target = path.resolve(this.directory, name);
+    if (!target.startsWith(`${path.resolve(this.directory)}${path.sep}`)) throw new Error('Vault path must remain inside the local data folder.');
+    return target;
+  }
+
+  async init() {
+    if (process.platform !== 'win32') throw new Error('Secure local storage requires Windows DPAPI. No local data was read or written.');
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await mkdir(this.codexDirectory, { recursive: true, mode: 0o700 });
+  }
 
   async read(name, fallback = null) {
     await this.init();

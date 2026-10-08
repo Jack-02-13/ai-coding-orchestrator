@@ -3,6 +3,26 @@ export const API_BASE = 'https://api.openai.com/v1';
 export const AUTH_BASE = 'https://auth.openai.com/api/accounts';
 export const APP_NAME = 'AI Developer Plus Bridge';
 
+export function redactSensitiveText(value, knownSecrets = [], { redactPersonalData = true } = {}) {
+  let text = String(value ?? '');
+  for (const secret of knownSecrets) {
+    if (typeof secret === 'string' && secret.length >= 8) text = text.split(secret).join('[憑證已遮蔽]');
+  }
+  text = text
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [憑證已遮蔽]')
+    .replace(/\b(?:sk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16})\b/g, '[憑證已遮蔽]')
+    .replace(/\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b/g, '[憑證已遮蔽]')
+    .replace(/((?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|api[_ -]?key|password|secret)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi, '$1[憑證已遮蔽]')
+    .replace(/([?&](?:code|state|access_token|refresh_token|id_token|client_secret)=)[^&#\s]+/gi, '$1[已遮蔽]');
+  if (redactPersonalData) {
+    text = text
+      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[個資已遮蔽]')
+      .replace(/(["'])([A-Z]:\\[^"']*)\1/gi, '$1[本機路徑已遮蔽]$1')
+      .replace(/\b[A-Z]:\\[^\s"'<>]+/gi, '[本機路徑已遮蔽]');
+  }
+  return text;
+}
+
 export function safeErrorCode(payload = {}) {
   return payload?.error?.code ?? payload?.code ?? null;
 }
@@ -66,5 +86,5 @@ export function extractSseEvents(buffer) {
 
 export function formatErrorDetail(status, payload = {}, requestId = '') {
   const code = safeErrorCode(payload);
-  return [status ? `HTTP ${status}` : '', code ? `code=${code}` : '', requestId ? `request_id=${requestId}` : '', payload?.error?.param ? `param=${payload.error.param}` : '', payload?.detail ?? payload?.error?.message ?? ''].filter(Boolean).join(' · ');
+  return redactSensitiveText([status ? `HTTP ${status}` : '', code ? `code=${code}` : '', requestId ? `request_id=${requestId}` : '', payload?.error?.param ? `param=${payload.error.param}` : '', payload?.detail ?? payload?.error?.message ?? ''].filter(Boolean).join(' · '));
 }

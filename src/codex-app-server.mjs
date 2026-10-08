@@ -1,6 +1,29 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { APP_NAME, classifyPlanFailure } from './helpers.mjs';
+import { mkdir } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { APP_NAME, classifyPlanFailure, redactSensitiveText } from './helpers.mjs';
+
+const CODEX_ENV_ALLOWLIST = [
+  'PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'APPDATA', 'LOCALAPPDATA',
+  'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'COMSPEC', 'PATHEXT', 'SYSTEMDRIVE', 'PROGRAMDATA',
+  'JAVA_HOME', 'ANDROID_HOME', 'ANDROID_SDK_ROOT', 'DOTNET_ROOT', 'VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH',
+  'CARGO_HOME', 'RUSTUP_HOME', 'GOPATH', 'GOROOT', 'NVM_HOME', 'NVM_SYMLINK', 'NPM_CONFIG_PREFIX',
+  'CONDA_PREFIX', 'CONDA_DEFAULT_ENV', 'LANG', 'LC_ALL', 'LANGUAGE', 'CI',
+];
+
+export function buildCodexEnvironment(accessToken, codexHome, source = process.env) {
+  const env = {};
+  const sourceKeys = Object.keys(source);
+  for (const key of CODEX_ENV_ALLOWLIST) {
+    const actualKey = sourceKeys.find((candidate) => candidate.toUpperCase() === key);
+    if (actualKey && source[actualKey]) env[key] = source[actualKey];
+  }
+  env.CODEX_HOME = codexHome;
+  env.ACCESS_TOKEN = accessToken;
+  return env;
+}
 
 function jsonPayload(value) {
   if (typeof value !== 'string') return value;
@@ -46,9 +69,10 @@ function resolveCodexCommand() {
 }
 
 export class CodexAppServer {
-  constructor({ accessToken, onProgress }) {
+  constructor({ accessToken, codexHome, onProgress }) {
     if (!accessToken) throw new Error('Codex app-server cannot start without the ChatGPT plan OAuth token.');
     this.accessToken = accessToken;
+    this.codexHome = codexHome ?? path.join(process.env.LOCALAPPDATA ?? os.homedir(), 'AI-Developer-Bridge', 'codex-home');
     this.onProgress = onProgress;
     this.proc = null;
     this.nextId = 1;
@@ -57,15 +81,25 @@ export class CodexAppServer {
     this.threadId = null;
     this.activeTurnId = null;
     this.stderrText = '';
+    this.stderrBuffer = '';
     this.lineInterface = null;
+  }
+
+  flushStderr(final = false) {
+    const keep = final ? 0 : Math.max(4096, this.accessToken.length + 32);
+    const splitAt = Math.max(0, this.stderrBuffer.length - keep);
+    const ready = this.stderrBuffer.slice(0, splitAt);
+    this.stderrBuffer = this.stderrBuffer.slice(splitAt);
+    if (!ready && !final) return;
+    const safeChunk = redactSensitiveText(ready, [this.accessToken]);
+    this.stderrText = `${this.stderrText}${safeChunk}`.slice(-8000);
+    if (safeChunk) this.onProgress?.({ kind: 'codex_log', text: safeChunk.slice(0, 1000) });
   }
 
   async start() {
     if (this.proc) return;
-    const env = { ...process.env, ACCESS_TOKEN: this.accessToken };
-    delete env.OPENAI_API_KEY;
-    delete env.CODEX_API_KEY;
-    delete env.CODEX_API_KEY_FILE;
+    await mkdir(this.codexHome, { recursive: true, mode: 0o700 });
+    const env = buildCodexEnvironment(this.accessToken, this.codexHome);
     const args = [
       'app-server', '--listen', 'stdio://',
       '-c', 'model_provider="openai_chatgpt_plan"',
@@ -75,14 +109,16 @@ export class CodexAppServer {
       '-c', 'model_providers.openai_chatgpt_plan.wire_api="responses"',
       '-c', 'model_providers.openai_chatgpt_plan.requires_openai_auth=false',
       '-c', 'model_providers.openai_chatgpt_plan.supports_websockets=false',
+      '-c', 'cli_auth_credentials_store="ephemeral"',
+      '-c', 'analytics.enabled=false',
+      '-c', 'feedback.enabled=false',
     ];
     if (process.platform === 'win32') args.push('-c', 'windows.sandbox="unelevated"');
     const command = resolveCodexCommand();
     this.proc = spawn(command.file, [...command.prefixArgs, ...args], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.proc.stderr.setEncoding('utf8').on('data', (chunk) => {
-      const safeChunk = chunk.split(this.accessToken).join('[redacted OAuth token]');
-      this.stderrText = `${this.stderrText}${safeChunk}`.slice(-8000);
-      this.onProgress?.({ kind: 'codex_log', text: safeChunk.slice(0, 1000) });
+      this.stderrBuffer += chunk;
+      this.flushStderr();
     });
     const child = this.proc;
     const lines = createInterface({ input: child.stdout });
@@ -91,6 +127,7 @@ export class CodexAppServer {
     lines.on('close', () => { if (this.lineInterface === lines) this.lineInterface = null; });
     child.on('error', (error) => this.failPending(error));
     child.on('exit', (code, signal) => {
+      this.flushStderr(true);
       const error = new Error(`Codex app-server exited (${signal ?? code}). ${this.stderrText.slice(-1200)}`);
       this.failPending(error);
       if (this.proc === child) this.proc = null;
@@ -102,9 +139,10 @@ export class CodexAppServer {
   }
 
   handleLine(line) {
+    line = redactSensitiveText(line, [this.accessToken]);
     let message;
     try { message = JSON.parse(line); } catch {
-      this.onProgress?.({ kind: 'codex_log', text: line.slice(0, 1000) });
+      this.onProgress?.({ kind: 'codex_log', text: redactSensitiveText(line).slice(0, 1000) });
       return;
     }
     if (message.id !== undefined && this.pending.has(message.id)) {
@@ -154,7 +192,13 @@ export class CodexAppServer {
         'sandbox_workspace_write.network_access': false,
         'sandbox_workspace_write.exclude_tmpdir_env_var': true,
         'sandbox_workspace_write.exclude_slash_tmp': true,
+        'shell_environment_policy.inherit': 'core',
+        'shell_environment_policy.ignore_default_excludes': false,
+        'cli_auth_credentials_store': 'ephemeral',
+        'analytics.enabled': false,
+        'feedback.enabled': false,
       },
+      ephemeral: true,
     };
     let result;
     if (savedThreadId) {
@@ -255,6 +299,7 @@ export class CodexAppServer {
       child.stdout?.destroy();
       child.stderr?.destroy();
     }
+    this.flushStderr(true);
     this.listeners.clear();
   }
 }

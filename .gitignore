@@ -1,6 +1,53 @@
+# Dependencies and local environment settings.
 node_modules/
 .env
-*.log
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+config.local.*
+*.local.json
+.secrets/
+/output/
+/outputs/
+/coverage/
+/artifacts/
+/.cache/
+
+# Local OAuth credentials, encrypted vault state, and runtime caches.
 data/
+runtime/
+*.dpapi.json
+credentials.json
+oauth-credentials.json
+oauth-cache.json
+token-cache.json
+.ai-developer-bridge/
+codex-home/
+*.token
+*.cookie
+cookies.txt
+
+# Logs, transcripts, databases, and private backups.
+*.log
+*.log.*
+logs/
+transcripts/
+*.transcript.jsonl
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+*.bak
+*.backup
+*.orig
+*.tmp
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Sensitive temporary test data; ordinary test fixtures remain trackable.
 test/quota-test-*/
 test/vault-test-*/

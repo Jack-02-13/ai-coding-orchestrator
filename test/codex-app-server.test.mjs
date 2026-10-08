@@ -117,6 +117,44 @@ test('Codex RPC still resolves successful requests and clears pending state', as
   assert.equal(codex.pending.size, 0);
 });
 
+test('new Codex threads are ephemeral and commands receive a filtered shell environment policy', async (t) => {
+  const { codex, requests } = fakeCodex(t, () => ({ response: { result: { thread: { id: 'thread-ephemeral' } } } }));
+  await codex.ensureThread({ model: 'account-model', projectPath, savedThreadId: null });
+  const request = requests.find((item) => item.method === 'thread/start');
+  assert.ok(request);
+  assert.equal(request.params.ephemeral, true);
+  assert.equal(request.params.config['shell_environment_policy.inherit'], 'core');
+  assert.equal(request.params.config['shell_environment_policy.ignore_default_excludes'], false);
+  assert.equal(request.params.config.cli_auth_credentials_store, 'ephemeral');
+  assert.equal(request.params.config['sandbox_workspace_write.network_access'], false);
+});
+
+test('Codex app-server output redacts the ChatGPT access token before it reaches transcript listeners', (t) => {
+  const token = 'synthetic-access-token-secret';
+  const codex = new CodexAppServer({ accessToken: token });
+  const seen = [];
+  codex.listeners.add((message) => seen.push(message));
+  codex.handleLine(JSON.stringify({ method: 'item/agentMessage/delta', params: { delta: `Bearer ${token}` } }));
+  assert.equal(seen.length, 1);
+  assert.equal(JSON.stringify(seen[0]).includes(token), false);
+  assert.match(seen[0].params.delta, /憑證已遮蔽/);
+  t.after(() => codex.close());
+});
+
+test('Codex stderr redaction catches an OAuth token split across process chunks', (t) => {
+  const token = 'synthetic-access-token-secret';
+  const seen = [];
+  const codex = new CodexAppServer({ accessToken: token, onProgress: (event) => seen.push(event.text) });
+  codex.stderrBuffer = `provider error Bearer ${token.slice(0, 11)}`;
+  codex.flushStderr();
+  codex.stderrBuffer += `${token.slice(11)}\n`;
+  codex.flushStderr(true);
+  const output = `${codex.stderrText}${seen.join('')}`;
+  assert.equal(output.includes(token), false);
+  assert.match(output, /憑證已遮蔽/);
+  t.after(() => codex.close());
+});
+
 test('Codex reports a command as running before its completion event', async (t) => {
   let codex;
   const { codex: instance } = fakeCodex(t, (request) => {
