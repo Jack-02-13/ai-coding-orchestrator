@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>AI Developer Bridge</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/transcript-ui.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">AI</span><div><strong>AI Developer</strong><small>GPT × Codex 工作台</small></div></div>
+    <div class="header-right"><span id="connection-badge" class="badge muted">尚未連線</span><button id="auth-button" class="button primary">Continue with ChatGPT</button><button id="signout-button" class="button quiet hidden">登出</button></div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="card auth-card">
+        <div class="section-heading"><div><p class="eyebrow">SUBSCRIPTION AUTH</p><h2>ChatGPT 授權</h2></div><span class="lock-icon">⌑</span></div>
+        <p id="auth-detail" class="muted-text">使用 Sign in with ChatGPT。此工作台不接受 API Key。</p>
+        <button id="models-button" class="button secondary full" disabled>載入帳號模型</button>
+        <div class="models-grid">
+          <label>GPT 管理者模型<select id="gpt-model" disabled><option value="">先登入並載入模型</option></select></label>
+          <label>Codex 開發模型<select id="codex-model" disabled><option value="">先登入並載入模型</option></select></label>
+        </div>
+        <button id="gpt-test-button" class="button secondary full" disabled>測試 GPT 單次回應</button>
+        <p class="hint">實際使用帳號可用模型清單；模型拒絕或額度不足時會保存狀態並暫停。</p>
+      </section>
+
+      <section class="card project-card">
+        <div class="section-heading"><div><p class="eyebrow">LOCAL WORKSPACE</p><h2>開發目錄</h2></div><span class="folder-icon">▱</span></div>
+        <label for="project-path">Codex 可編輯的本機專案路徑</label>
+        <div class="path-row"><input id="project-path" type="text" placeholder="例如 C:\Projects\my-project" autocomplete="off"><button id="save-path" class="button secondary">設定</button></div>
+        <p class="hint">Codex app-server 僅可在此目錄寫入，且程式執行環境的網路存取關閉。</p>
+      </section>
+
+      <section class="card controls-card">
+        <div class="section-heading"><div><p class="eyebrow">RUN CONTROL</p><h2>流程控制</h2></div><span class="pulse-dot"></span></div>
+        <div class="control-grid">
+          <button id="pause-button" class="button secondary" disabled>暫停</button>
+          <button id="resume-button" class="button primary" disabled>繼續</button>
+          <button id="stop-button" class="button danger" disabled>停止</button>
+          <button id="accept-button" class="button accept" disabled>人工驗收</button>
+        </div>
+        <label class="compact-label" for="review-feedback">驗收意見</label>
+        <textarea id="review-feedback" rows="2" placeholder="需要修改的地方；送出後會交由 GPT 產生下一輪 Codex 指示"></textarea>
+        <button id="feedback-button" class="button secondary full" disabled>提交驗收意見並繼續</button>
+        <p id="status-detail" class="status-note">準備就緒</p>
+      </section>
+
+      <section class="card queue-card">
+        <div class="section-heading"><div><p class="eyebrow">PRIORITY QUEUE</p><h2>待辦優先順序</h2></div><span id="queue-count" class="count-pill">0</span></div>
+        <div id="task-list" class="task-list empty">尚無待辦</div>
+      </section>
+
+      <footer class="sidebar-footer">本機資料使用 Windows DPAPI 加密儲存<br><span id="storage-location"></span></footer>
+    </aside>
+
+    <section class="main-column">
+      <section class="hero">
+        <div><p class="eyebrow">LOCAL AI ENGINEERING LOOP</p><h1>把需求交給 GPT，讓 Codex 在專案中實作。</h1><p>GPT 規劃與審查，Codex 修改檔案並回報實際檢查結果。你可以隨時插入需求、暫停或接手驗收。</p></div>
+        <div class="loop-visual" aria-label="使用者需求流向 GPT、Codex，再由 GPT 審查"><span>你</span><i>→</i><span class="gpt-node">GPT</span><i>→</i><span class="codex-node">Codex</span><i>↻</i></div>
+      </section>
+
+      <section class="card task-composer">
+        <div class="section-heading"><div><p class="eyebrow">NEW DEVELOPMENT TASK</p><h2>建立開發任務</h2></div><span class="compose-icon">＋</span></div>
+        <textarea id="task-input" rows="4" placeholder="描述你想完成的功能、限制與驗收條件…"></textarea>
+        <div class="composer-footer"><label class="priority-select">優先順序<select id="task-priority"><option value="normal">一般</option><option value="high">高</option><option value="urgent">最高</option><option value="low">低</option></select></label><span id="composer-hint" class="hint">GPT/Codex 都會使用此 ChatGPT 帳號的訂閱用量</span><button id="start-button" class="button primary large" disabled><span id="start-label">開始 GPT → Codex 流程</span><span>↗</span></button></div>
+      </section>
+
+      <section class="intervention card">
+        <div class="intervention-title"><span class="intervention-mark">＋</span><div><h3>插入新需求</h3><p>送給目前任務；若 Codex 正在執行，會即時追加至該輪。</p></div></div>
+        <div class="intervention-row"><input id="requirement-input" type="text" placeholder="例如：保留舊版設定檔的相容性"><button id="requirement-button" class="button secondary" disabled>插入</button></div>
+      </section>
+
+      <section class="transcript-section">
+        <div class="transcript-heading"><div><p class="eyebrow">PERSISTENT TRANSCRIPT</p><h2>對話與開發紀錄</h2></div><div class="transcript-tools"><label class="sr-only" for="transcript-task">選擇要查看的紀錄</label><select id="transcript-task" aria-label="選擇要查看的開發任務紀錄"><option value="">尚無開發任務</option></select><button id="save-transcript" class="button secondary" disabled>下載此紀錄</button><span id="message-count" class="muted-text">0 則紀錄</span></div></div>
+        <div id="live-status" class="live-status hidden" role="status" aria-live="polite"><span class="live-status-dot"></span><div class="live-status-copy"><strong id="live-status-title">Codex 正在執行</strong><p id="live-status-detail"></p></div><time id="live-status-elapsed"></time></div>
+        <div id="transcript" class="transcript"><div class="empty-state"><div class="empty-orbit"><span>G</span><i>↔</i><b>C</b></div><strong>每個決策與回報都會留在這裡</strong><p>先完成 ChatGPT 授權、載入模型並選擇專案目錄。</p></div></div>
+      </section>
+
+      <div id="error-banner" class="error-banner hidden" role="alert"><span class="error-icon">!</span><div><strong id="error-title">流程已暫停</strong><p id="error-message"></p><small id="error-detail"></small></div></div>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status"></div>
+</body>
+</html>

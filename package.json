@@ -1,0 +1,16 @@
+{
+  "name": "ai-developer-chatgpt-codex-bridge",
+  "version": "0.1.0",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "description": "Local, open-source ChatGPT plan and Codex app-server bridge with manual controls.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "jose": "^6.1.0"
+  }
+}
